@@ -362,7 +362,7 @@ const RUNTIME_BODY = `
   }
   function log(msg, level) {
     const lvl = level || 'info';
-    const prefix = '[NexGen v6] ' + new Date().toLocaleTimeString();
+    const prefix = '[NexGen v6.1] ' + new Date().toLocaleTimeString();
     if (lvl === 'error') console.error(prefix, msg);
     else if (lvl === 'warn') console.warn(prefix, msg);
     else console.log(prefix, msg);
@@ -385,20 +385,12 @@ const RUNTIME_BODY = `
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  /* ── debug hooks ─────────────────────────────────────────────────────── */
+  /* ── debug hooks (passive only — never replace native console fns
+       because pages sometimes introspect console.error.caller/.arguments
+       which throws on strict-mode wrappers) ──────────────────────────── */
   function installGlobalDebugHooks() {
     if (window.__nexgenDebugHooksInstalled) return;
     window.__nexgenDebugHooksInstalled = true;
-    const oce = console.error.bind(console);
-    console.error = function () {
-      try { pushDebug('error', 'console.error', Array.from(arguments).map(serializeForDebug).join(' | ')); } catch (e) {}
-      return oce.apply(console, arguments);
-    };
-    const ocw = console.warn.bind(console);
-    console.warn = function () {
-      try { pushDebug('warn', 'console.warn', Array.from(arguments).map(serializeForDebug).join(' | ')); } catch (e) {}
-      return ocw.apply(console, arguments);
-    };
     window.addEventListener('error', (ev) => {
       pushDebug('error', 'window.error', { message: ev.message, filename: ev.filename, lineno: ev.lineno, colno: ev.colno });
     });
@@ -766,18 +758,55 @@ const RUNTIME_BODY = `
   }
 
   function findActionButton(scope, kind) {
-    const root = scope || document;
+    // Search a sequence of scopes from narrow to wide so we always find the
+    // button regardless of where the page renders the edit form footer.
+    const scopes = [];
+    if (scope) scopes.push(scope);
+    const editArea = document.querySelector('.rgEditRow, .rgEditForm, tr[id*="EditForm"]');
+    if (editArea && !scopes.includes(editArea)) scopes.push(editArea);
+    const editFooter = document.querySelector('.rgEditFormFooter, .rgFooter, [id*="EditFormItem"]');
+    if (editFooter && !scopes.includes(editFooter)) scopes.push(editFooter);
+    scopes.push(document);
+
     const sels = kind === 'update'
-      ? ['input[id*="btnUpdate"]','input[id*="UpdateButton"]','input[value*="Update"]','input[value*="Save"]','button[id*="Update"]','button[id*="Save"]','a[id*="Update"]','a[id*="Save"]']
-      : ['input[id*="btnCancel"]','input[id*="CancelButton"]','input[value*="Cancel"]','button[id*="Cancel"]','a[id*="Cancel"]'];
-    for (const s of sels) { const f = root.querySelector(s); if (f) return f; }
-    const ctrls = Array.from(root.querySelectorAll('input, button, a'));
-    for (const c of ctrls) {
-      const blob = [c.id||'', c.name||'', c.getAttribute('value')||'', c.textContent||'', c.getAttribute('title')||'', c.getAttribute('aria-label')||'', c.getAttribute('onclick')||'', c.getAttribute('href')||''].join(' ').toUpperCase();
-      if (kind === 'update') { if (/(UPDATE|SAVE)/.test(blob) && !/(CANCEL|CLOSE)/.test(blob)) return c; }
-      else { if (/(CANCEL|CLOSE)/.test(blob) && !/(UPDATE|SAVE)/.test(blob)) return c; }
+      ? ['input[id*="btnUpdate"]','input[id*="UpdateButton"]','input[id*="PerformInsertButton"]','input[value="Update"]','input[value="Save"]','button[id*="Update"]','button[id*="Save"]','a[id*="Update"]','a[id*="Save"]','a[id*="PerformInsert"]']
+      : ['input[id*="btnCancel"]','input[id*="CancelButton"]','input[value="Cancel"]','button[id*="Cancel"]','a[id*="Cancel"]'];
+
+    for (const root of scopes) {
+      for (const s of sels) {
+        const f = root.querySelector(s);
+        if (f) return f;
+      }
+    }
+    // Text-based fallback across all scopes
+    for (const root of scopes) {
+      const ctrls = Array.from(root.querySelectorAll('input, button, a'));
+      for (const c of ctrls) {
+        const blob = [c.id||'', c.name||'', c.getAttribute('value')||'', (c.textContent||'').trim(), c.getAttribute('title')||'', c.getAttribute('aria-label')||'', c.getAttribute('onclick')||''].join(' ').toUpperCase();
+        if (kind === 'update') {
+          if (/(UPDATE|SAVE|INSERT)/.test(blob) && !/(CANCEL|CLOSE|DELETE)/.test(blob)) return c;
+        } else {
+          if (/(CANCEL|CLOSE)/.test(blob) && !/(UPDATE|SAVE|INSERT|DELETE)/.test(blob)) return c;
+        }
+      }
     }
     return null;
+  }
+
+  function dumpButtonCandidates(scope) {
+    const root = scope || document;
+    const out = [];
+    const ctrls = Array.from(root.querySelectorAll('input, button, a')).slice(0, 40);
+    for (const c of ctrls) {
+      out.push([
+        c.tagName,
+        'id=' + (c.id || ''),
+        'name=' + (c.name || ''),
+        'value=' + (c.getAttribute('value') || ''),
+        'text=' + ((c.textContent || '').trim().slice(0, 30))
+      ].join(' | '));
+    }
+    return out.join(' || ');
   }
 
   function findFormFields(root) {
@@ -851,7 +880,9 @@ const RUNTIME_BODY = `
 
     if (!fields.updateBtn) {
       log('Update button not found', 'error');
-      if (fields.cancelBtn) { await clickButton(fields.cancelBtn); await waitForAjax(CONFIG.AJAX_TIMEOUT); }
+      pushDebug('error', 'edit form button candidates', dumpButtonCandidates(editForm));
+      const cancel = fields.cancelBtn || findActionButton(document, 'cancel');
+      if (cancel) { await clickButton(cancel); await waitForAjax(CONFIG.AJAX_TIMEOUT); await waitForEditFormClose(5000); }
       return false;
     }
     await clickButton(fields.updateBtn);
@@ -993,7 +1024,7 @@ function buildRuntimeScript(masterRows, saleRows, coolRows) {
     "// ==UserScript==\n" +
     "// @name         NexGen365 Unified Sign Automator\n" +
     "// @namespace    https://nexgen365.com/\n" +
-    "// @version      6.0.0\n" +
+    "// @version      6.1.0\n" +
     "// @description  Generated by NexGen Script Builder\n" +
     "// @match        https://www.nexgen365.com/Create/CreateSigns.aspx*\n" +
     "// @match        https://nexgen365.com/Create/CreateSigns.aspx*\n" +
@@ -1100,7 +1131,7 @@ export default function NexGenScriptBuilder() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <Badge>v6.0.0</Badge>
+            <Badge>v6.1.0</Badge>
             <Button variant="outline" size="sm" onClick={loadSampleData}>
               <Database className="w-4 h-4" />
               Load sample
